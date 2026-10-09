@@ -4,31 +4,40 @@ import numpy as np
 from time import perf_counter
 import scipy.ndimage as ndi
 from lantz import Q_
-from skimage.feature import peak_local_max
 from scipy.optimize import curve_fit
+from qtpy import QtCore
 
-from imswitch.imcommon.framework import Thread, Timer
+from imswitch.imcommon.framework import Signal, Thread, Timer, Worker
 from imswitch.imcommon.model import initLogger
 from ..basecontrollers import ImConWidgetController
 
 
 class iScatFocusController(ImConWidgetController):
-    """Linked to iScatFocusWidget."""
-    
+    """Linked to iScatFocusWidget.
+
+    Grabbing and analyzing the focus camera frames, the calibration and the auto-tuning run in a
+    FocusWorker thread. The PID update, the piezo moves of the lock and all GUI updates stay in the
+    GUI thread, since the NidaqManager can't take commands from two threads at the same time. """
+
+    sigStartCalibration = Signal(float, float, int)  # (from_V, to_V, steps), runs in FocusWorker
+    sigStartAutoTune = Signal(float)  # (step_size), runs in FocusWorker
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.__logger = initLogger(self)
+        self._worker = None
+        self._thread = None
 
+        # Reads the specific values from the configuration file.
+        if self._setupInfo.iScatFocus is None:
+            return
+
+        # Each widget action is connected once (the buttons emit these signals)
         self._widget.sigPIDToggled.connect(self.toggleFocus)
         self._widget.sigSetPosition.connect(self.moveZ)
         self._widget.sigAutoTune.connect(self.autoTune)
         self._widget.sigPIDValuesChanged.connect(self.updatePIDParameters)
         self._widget.sigCalibrate.connect(self.runCalibration)
-
-        # Reads the specific values from the configuration file. 
-        if self._setupInfo.iScatFocus is None:
-            return
 
         self.camera = self._setupInfo.iScatFocus.camera
         self.positioner = self._setupInfo.iScatFocus.positioner
@@ -44,14 +53,12 @@ class iScatFocusController(ImConWidgetController):
         self._widget.kiEdit.textChanged.connect(self.unlockFocus)
         self._widget.kdEdit.textChanged.connect(self.unlockFocus)
 
-        self._widget.lockButton.clicked.connect(self.toggleFocus)
-        self._widget.positionSetButton.clicked.connect(self.moveZ)
-        self._widget.autoTuneButton.clicked.connect(lambda: self.autoTune(step_size=0.5))
-
         # Calibration storage
         self.volts_per_px = None  # Calibration slope (V/px)
         self.px_per_volt = None   # Inverse calibration (px/V)
         self.zero_offset_px = None # Position at 0V
+        self.px_per_volt_forward = None   # Slope while the voltage increases (px/V)
+        self.px_per_volt_backward = None  # Slope while the voltage decreases (px/V)
 
         # Set the initial values
         self.setPointSignal = 0
@@ -68,119 +75,89 @@ class iScatFocusController(ImConWidgetController):
         self.timeData = np.zeros(self.buffer)
         self.lockingData = np.zeros(7)
         self.pid = None
+        self._lastPIDTime = None
+        # Optional piezo sensitivity from the setup file, to show the stability in nm
+        self.piezoNmPerVolt = self._setupInfo.iScatFocus.piezoNmPerVolt
         
         self.pTermData = np.zeros(self.buffer)
         self.iTermData = np.zeros(self.buffer)
         self.dTermData = np.zeros(self.buffer)
 
+        self.startTime = perf_counter()
+
         # Starts acquisition. I don't know if this can cause problems if, the camera of interest is also used for acquisition
         self._master.detectorsManager[self.camera].startAcquisition()
-        self.__processDataThread = ProcessDataThread(self)
 
-        self.timer = Timer()
-        self.timer.timeout.connect(self.update)
-        self.timer.start(int(self.focusTime))
-        self.startTime = perf_counter()
-    
-    # Following functions are just for controlling and setting different parameters
-    def __del__(self):
-        self.__processDataThread.quit()
-        self.__processDataThread.wait()
-        if hasattr(super(), '__del__'):
-            super().__del__()
+        # Frame grabbing, analysis, calibration and auto-tuning run in their own thread
+        self._worker = FocusWorker(self._master.detectorsManager[self.camera],
+                                   self._master.positionersManager[self.positioner],
+                                   int(self.focusTime))
+        self._worker.sigFrameAnalyzed.connect(self.update)
+        self._worker.sigCalibrationDone.connect(self.calibrationDone)
+        self._worker.sigAutoTuneDone.connect(self.autoTuneDone)
+        self.sigStartCalibration.connect(self._worker.runCalibration)
+        self.sigStartAutoTune.connect(self._worker.runAutoTune)
+        self._thread = Thread()
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._thread.finished.connect(self._worker.stop)
+        self._thread.start()
+
+    def closeEvent(self):
+        """ Stops the FocusWorker thread; a running calibration/auto-tune is aborted. Called before
+        the cameras are closed. """
+        if self._thread is None:
+            return
+        self.unlockFocus()
+        self._worker.abort()
+        self._thread.quit()
+        self._thread.wait()
+        self._thread = None
+        self.__logger.debug('Focus worker thread stopped')
+
+    def _setRoutineRunning(self, running, text=None):
+        """ Disables the buttons that move the piezo while calibration/auto-tuning runs. """
+        self._widget.calibButton.setEnabled(not running)
+        self._widget.autoTuneButton.setEnabled(not running)
+        self._widget.lockButton.setEnabled(not running)
+        self._widget.positionSetButton.setEnabled(not running)
+        if text is not None:
+            self._widget.calibResultLabel.setText(text)
 
     def runCalibration(self, from_V: float, to_V: float, steps: int):
-        try:
-            # 1. Prepare measurement points with hysteresis compensation
-            test_voltages = np.linspace(from_V, to_V, steps)
-            test_voltages = np.concatenate([test_voltages, test_voltages[::-1]])  # Forward and back
-            
-            # 2. Store initial position
-            initial_V = self._master.positionersManager[self.positioner].get_abs()
-            positions = []
-            
-            # 3. Enhanced measurement collection
-            for i, v in enumerate(test_voltages):
-                # Move with overshoot compensation
-                if i > 0:
-                    overshoot = 0.1 * (v - test_voltages[i-1])
-                    self._master.positionersManager[self.positioner].setPosition(v + overshoot, 0)
-                    time.sleep(0.1)
-                
-                # Final precise positioning
-                self._master.positionersManager[self.positioner].setPosition(v, 0)
-                
-                # Dynamic settling time based on step size
-                step_size = abs(v - test_voltages[i-1]) if i > 0 else 0
-                settle_time = max(0.5, step_size * 0.5)  # 0.5s + 0.5s per volt
-                time.sleep(settle_time)
-                
-                # Capture multiple samples with validation
-                sample_pos = []
-                for _ in range(10):
-                    img = self.__processDataThread.grabCameraFrame()
-                    pos = self.__processDataThread.getBeamPosition(img)
-                    if pos is not None:
-                        sample_pos.append(pos)
-                    time.sleep(0.05)
-                
-                if len(sample_pos) < 5:
-                    raise ValueError(f"Insufficient valid positions at {v}V")
-                    
-                # Use median and IQR filtering
-                q75, q25 = np.percentile(sample_pos, [75, 25])
-                iqr = q75 - q25
-                valid_pos = [p for p in sample_pos if (q25 - 1.5*iqr) < p < (q75 + 1.5*iqr)]
-                median_pos = np.median(valid_pos)
-                positions.append(median_pos)
-                
-                self.__logger.debug(f"Voltage {v:.2f}V -> {median_pos:.2f} px (n={len(valid_pos)})")
-            
-            # 4. Split forward and backward measurements
-            n = len(test_voltages)//2
-            forward_voltages = test_voltages[:n]
-            forward_positions = positions[:n]
-            backward_voltages = test_voltages[n:]
-            backward_positions = positions[n:]
-            
-            # 5. Two-way linear regression
-            def fit_line(voltages, positions):
-                A = np.vstack([voltages, np.ones(len(voltages))]).T
-                return np.linalg.lstsq(A, positions, rcond=None)[0]
-            
-            m_forward, b_forward = fit_line(forward_voltages, forward_positions)
-            m_backward, b_backward = fit_line(backward_voltages, backward_positions)
-            
-            # 6. Use average of both directions
-            px_per_volt = (m_forward + m_backward) / 2
-            zero_offset = (b_forward + b_backward) / 2
-            
-            # 7. Validate results
-            if abs(px_per_volt) < 1:
-                raise ValueError(f"Implausible calibration: {px_per_volt:.2f} px/V")
-            
-            # 8. Store and update
-            self.px_per_volt = px_per_volt
-            self.volts_per_px = 1/px_per_volt
-            self.zero_offset_px = zero_offset
-            
-            # 9. Restore original position
-            self._master.positionersManager[self.positioner].setPosition(initial_V, 0)
-            
-            # 10. Update UI with both forward and backward results
-            self._widget.updateCalibrationResult(
-                slope=self.volts_per_px,
-                intercept=self.zero_offset_px,
-                forward_slope=1/m_forward,
-                backward_slope=1/m_backward
-            )
-            
-            self.__logger.info(f"Calibration complete: {px_per_volt:.2f} px/V, "
-                            f"Zero at {zero_offset:.2f} px")
-            
-        except Exception as e:
-            self.__logger.error(f"Calibration failed: {str(e)}")
-            raise
+        """ Starts the calibration in the FocusWorker thread, so the GUI stays responsive. """
+        if self._worker is None or self._worker.busy:
+            return
+        self.unlockFocus()
+        self._setRoutineRunning(True, 'Calibration running...')
+        self.sigStartCalibration.emit(from_V, to_V, steps)
+
+    def calibrationDone(self, result):
+        """ Receives the calibration result from the FocusWorker. """
+        self._setRoutineRunning(False)
+        if 'error' in result:
+            self._widget.calibResultLabel.setText(
+                f"<font color='red'>Calibration failed: {result['error']}</font>")
+            return
+
+        self.px_per_volt = result['px_per_volt']
+        self.volts_per_px = 1 / result['px_per_volt']
+        self.zero_offset_px = result['zero_offset']
+        self.px_per_volt_forward = result['m_forward']
+        self.px_per_volt_backward = result['m_backward']
+
+        # Update UI with both forward and backward results
+        self._widget.updateCalibrationResult(
+            slope=self.volts_per_px,
+            intercept=self.zero_offset_px,
+            forward_slope=1 / result['m_forward'],
+            backward_slope=1 / result['m_backward'],
+            angle_deg=result['angle_deg']
+        )
+        self.__logger.info(f"Calibration complete: {self.px_per_volt:.2f} px/V "
+                           f"(forward {self.px_per_volt_forward:.2f}, backward "
+                           f"{self.px_per_volt_backward:.2f}), direction {result['angle_deg']:.1f} deg, "
+                           f"Zero at {self.zero_offset_px:.2f} px")
 
     def unlockFocus(self):
         """Release focus lock and reset controller state."""
@@ -192,7 +169,7 @@ class iScatFocusController(ImConWidgetController):
             self._widget.setpointLine.hide()  # Hide rather than remove
             self.__logger.debug("Focus lock released")
 
-    def toggleFocus(self):
+    def toggleFocus(self, *_):
         """Toggle focus lock state with proper PID initialization."""
         if self._widget.lockButton.isChecked():
             try:
@@ -220,24 +197,27 @@ class iScatFocusController(ImConWidgetController):
         self._master.detectorsManager[self.camera].openPropertiesDialog()
         self.__logger.debug('Open camera settings dialog')
 
-    def moveZ(self):
-        target_voltage = float(self._widget.positionEdit.text())
+    def moveZ(self, target_voltage=None):
+        if target_voltage is None:
+            target_voltage = float(self._widget.positionEdit.text())
         # Ensure voltage stays within -10 to +10V range
         target_voltage = max(-10, min(10, target_voltage))
         self._master.positionersManager[self.positioner].setPosition(target_voltage, 0)
         self.__logger.debug(f'Move Z-piezo to {target_voltage} V')
 
     # Update focus lock
-    def update(self):
-        # 1 Grab camera frame
-        img = self.__processDataThread.grabCameraFrame()
-        # 2 Pass camera frame and get back focusSignalPosition from ProcessDataThread
-        self.setPointSignal = self.__processDataThread.update()
+    def update(self, img, position):
+        """ Called by the FocusWorker for every analyzed frame (runs in the GUI thread). """
+        # 1+2 Camera frame and beam position come from the FocusWorker; the displayed frame is
+        # the one that was analyzed
+        self._worker.frameConsumed()
+        self.setPointSignal = position
         # 3 Update PID with the new setPointSignal and get back the distance to move, send to
-        # update the PID control, and then send the move-distance to the z-piezo
+        # update the PID control, and then send the move-distance to the z-piezo.
+        # Every correction is applied (no deadband): at ~1 um/V, 1 mV is already ~1 nm.
         if self.locked:
             voltage_adjustment = self.updatePID()
-            if abs(voltage_adjustment) > 0.001:  # 2mV threshold
+            if voltage_adjustment != 0:
                 new_voltage = self.currentPosition + voltage_adjustment
                 # Clamp to -10V to +10V range
                 new_voltage = max(-10, min(10, new_voltage))
@@ -271,10 +251,28 @@ class iScatFocusController(ImConWidgetController):
 
     def updatePID(self):
         self.currentPosition = self._master.positionersManager[self.positioner].get_abs()
-        
-        # Get PID correction
-        correction = self.pid.update(self.setPointSignal)
-        
+
+        # Real time since the last update (frames can be skipped if the GUI is busy)
+        now = perf_counter()
+        dt = now - self._lastPIDTime if self._lastPIDTime is not None else self.focusTime / 1000
+        self._lastPIDTime = now
+
+        # Get PID correction (voltage change for this step)
+        try:
+            correction = self.pid.update(self.setPointSignal, dt)
+        except RuntimeError as e:
+            # Raised by PID._check_stability if the lock oscillates
+            self.__logger.warning(f"{e}. Unlocking for safety.")
+            self.unlockFocus()
+            return 0
+
+        # Hysteresis correction: the gains are tuned for the average slope; the spot moves by
+        # px_per_volt_forward per volt while the voltage increases and by px_per_volt_backward
+        # while it decreases
+        if self.px_per_volt_forward is not None and correction != 0:
+            slope = self.px_per_volt_forward if correction > 0 else self.px_per_volt_backward
+            correction *= self.px_per_volt / slope
+
         # Safety checks
         if abs(correction) > 1.0:  # 1V max correction
             self.__logger.warning("Large correction detected! Unlocking for safety.")
@@ -287,7 +285,7 @@ class iScatFocusController(ImConWidgetController):
         """Thread-safe PID parameter updates with validation."""
 
         kp = np.clip(kp, 0.00000, 1)  # Example max P gain
-        ki = np.clip(ki, 0.00000, 0.1)  # Example max I gain
+        ki = np.clip(ki, 0.00000, 10)  # Max I gain; auto-tune gives ~alpha/(slope*dt), e.g. 0.3
         kd = np.clip(kd, 0.00000, 0.1) # Example max D gain
         
         if self.locked:
@@ -304,9 +302,15 @@ class iScatFocusController(ImConWidgetController):
 
     def lockFocus(self, kp, ki, kd, current_voltage):
         if not self.locked:
-            self.pid = PID(self.setPointSignal, 
-                          dt=self.focusTime/1000, 
+            # Set point from the mean of the last measurements instead of a single noisy one
+            n = min(self.currPoint, self.buffer, 10)
+            recent = self.setPointData[:self.currPoint][-n:] if self.currPoint < self.buffer \
+                else self.setPointData[-n:]
+            setpoint = float(np.mean(recent)) if n > 0 else self.setPointSignal
+            self.pid = PID(setpoint,
+                          dt=self.focusTime/1000,
                           kp=kp, ki=ki, kd=kd)
+            self._lastPIDTime = None
             self.lockPosition = current_voltage
             self.locked = True
     
@@ -318,215 +322,431 @@ class iScatFocusController(ImConWidgetController):
         self.iTermCurve.clear()
         self.dTermCurve.clear()
             
-    def autoTune(self, step_size=0.5, settle_threshold=0.01):
-        """Automated tuning routine"""
+    def autoTune(self, step_size=0.5):
+        """ Automated tuning (see FocusWorker.runAutoTune). Runs in the FocusWorker thread; the
+        result arrives in autoTuneDone. step_size is the piezo step in V for the step response;
+        it must move the spot clearly more than the noise. """
+        if self._worker is None or self._worker.busy:
+            return
         self.__logger.info("Starting auto-tuning...")
-        
+
         # 1. Disable controller
         self.unlockFocus()
-        
-        # 2. Find system response
-        test_voltages = [-step_size, 0, step_size]
-        positions = []
-        for v in test_voltages:
-            self._master.positionersManager[self.positioner].move(v, 0)
-            time.sleep(0.5)  # Settling time
-            positions.append(self.setPointSignal)
-        
-        # Calculate system gain
-        response_slope = (positions[2] - positions[0]) / (2 * step_size)  # px/V
-        
-        # 3. Ziegler-Nichols tuning (conservative)
-        ku = 1.0 / abs(response_slope)  # Ultimate gain estimate
-        pu = 0.5  # Estimated oscillation period (s) - adjust based on observations
-        
-        # PID coefficients (Pessen Integral Rule)
-        kp = 0.7 * ku
-        ki = 1.75 * ku / pu
-        kd = 0.21 * ku * pu
-        
-        self.__logger.info(f"Suggested parameters: kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f}")
-        
+        self._setRoutineRunning(True)
+        self._widget.setAutoTuneResult('Auto-tuning running (keep the setup still)...')
+        self.sigStartAutoTune.emit(step_size)
+
+    def autoTuneDone(self, result):
+        """ Receives the auto-tuning result from the FocusWorker. """
+        self._setRoutineRunning(False)
+        if 'error' in result:
+            self.__logger.error(f"Auto-tuning failed: {result['error']}")
+            self._widget.setAutoTuneResult(
+                f"<font color='red'>Auto-tuning failed: {result['error']}</font>")
+            return
+        kp, ki, kd = result['kp'], result['ki'], result['kd']
+        self.__logger.info(f"Suggested parameters: kp={kp:.4f}, ki={ki:.4f}, kd={kd:.4f} "
+                           f"({result})")
+
         # Apply to GUI
         self._widget.kpEdit.setText(f"{kp:.4f}")
         self._widget.kiEdit.setText(f"{ki:.4f}")
         self._widget.kdEdit.setText(f"{kd:.4f}")
-        
-        return kp, ki, kd
+
+        # Measured noise/drift and expected stability, in nm if the piezo sensitivity is known
+        def fmt(px):
+            if self.piezoNmPerVolt:
+                return f"{px:.3f} px = {px / result['slope'] * self.piezoNmPerVolt:.2f} nm"
+            return f"{px:.3f} px"
+        self._widget.setAutoTuneResult(
+            f"<b>Auto-tune:</b> gain {result['slope']:.2f} px/V, delay {result['delay']} frame(s), "
+            f"period {result['dt'] * 1000:.0f} ms<br>"
+            f"Noise per frame: {fmt(result['noise_px'])}<br>"
+            f"Random drift per frame: {fmt(result['drift_px'])}<br>"
+            f"Linear drift per frame: {fmt(abs(result['ramp_px']))}<br>"
+            f"Integrator gain alpha = {result['alpha']:.3f}<br>"
+            f"<b>Expected lock stability (RMS): {fmt(result['stability_px'])}</b>"
+        )
 
 
-class ProcessDataThread(Thread):
-    def __init__(self, controller, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._controller = controller
-        self._last_valid_position = 0  # Fallback position
-        self._fit_fail_count = 0
-        self._max_fit_fails = 3  # Allow 3 consecutive failures before fallback
+class _Aborted(Exception):
+    """ Raised in the FocusWorker when a calibration/auto-tune is aborted. """
+
+
+class FocusWorker(Worker):
+    """ Runs in its own thread: grabs one frame per update from the focus camera, determines the
+    beam position and sends both to the controller. Also runs the calibration and the auto-tuning,
+    which wait for the piezo and need many frames, so they don't block the GUI. """
+
+    sigFrameAnalyzed = Signal(object, float)  # (image, beam position in px)
+    sigCalibrationDone = Signal(object)  # dict with the results, or {'error': message}
+    sigAutoTuneDone = Signal(object)  # dict with kp, ki, kd, or {'error': message}
+
+    def __init__(self, detector, positioner, updatePeriodMs):
+        super().__init__()
+        self.__logger = initLogger(self)
+        self._detector = detector
+        self._positioner = positioner
+        self._updatePeriodMs = updatePeriodMs
+        self._timer = None
+        self._busy = False  # calibration/auto-tune running
+        self._abort = False
+        self._frameConsumed = True  # the controller has processed the last emitted frame
+        self._last_valid_spot = None  # Fallback spot centre (x, y) if a fit fails
+        self._fit_radius = 50  # Half size of the fit window around the spot (px)
+        # Unit vector along which the spot moves with the piezo voltage, from the calibration.
+        # None: not calibrated, the x coordinate is used as position signal.
+        self._direction = None
+
+    @property
+    def busy(self):
+        return self._busy
+
+    def run(self):
+        self._timer = Timer()
+        self._timer.timeout.connect(self._update)
+        self._timer.start(self._updatePeriodMs)
+
+    def stop(self):
+        if self._timer is not None:
+            self._timer.stop()
+
+    def abort(self):
+        """ Aborts a running calibration/auto-tune; can be called from any thread. """
+        self._abort = True
+
+    def frameConsumed(self):
+        """ Called by the controller when it has processed the last emitted frame. """
+        self._frameConsumed = True
+
+    def _update(self):
+        # Skip while the GUI hasn't processed the last frame, so frames don't pile up in the queue
+        if self._busy or not self._frameConsumed:
+            return
+        img = self.grabCameraFrame()
+        if img is None:
+            return
+        position = self.positionSignal(self.fitSpot(img))
+        if position is None:
+            return
+        self._frameConsumed = False
+        self.sigFrameAnalyzed.emit(img, float(position))
+
+    def _sleep(self, seconds):
+        """ time.sleep that ends early (raising _Aborted) when abort() is called. """
+        end = time.time() + seconds
+        while True:
+            if self._abort:
+                raise _Aborted()
+            remaining = end - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.05, remaining))
+
+    # Declared as Qt slots so that the controller's signals run them in the worker thread
+    # (without @Slot, PyQt calls them in the thread of the emitting controller)
+    @QtCore.Slot(float, float, int)
+    def runCalibration(self, from_V, to_V, steps):
+        self._busy = True
+        self._abort = False
+        initial_V = None
+        try:
+            # 1. Prepare measurement points with hysteresis compensation
+            test_voltages = np.linspace(from_V, to_V, steps)
+            test_voltages = np.concatenate([test_voltages, test_voltages[::-1]])  # Forward and back
+
+            # 2. Store initial position
+            initial_V = self._positioner.get_abs()
+            spots = []  # spot centre (x, y) per voltage
+
+            # 3. Enhanced measurement collection
+            for i, v in enumerate(test_voltages):
+                # Move with overshoot compensation
+                if i > 0:
+                    overshoot = 0.1 * (v - test_voltages[i-1])
+                    self._positioner.setPosition(v + overshoot, 0)
+                    self._sleep(0.1)
+
+                # Final precise positioning
+                self._positioner.setPosition(v, 0)
+
+                # Dynamic settling time based on step size
+                step_size = abs(v - test_voltages[i-1]) if i > 0 else 0
+                settle_time = max(0.5, step_size * 0.5)  # 0.5s + 0.5s per volt
+                self._sleep(settle_time)
+
+                # Capture multiple samples with validation (2D Gaussian fit, same as the lock)
+                samples = []
+                for _ in range(10):
+                    spot = self.fitSpot(self.grabCameraFrame(), fallback=False)
+                    if spot is not None:
+                        samples.append(spot)
+                    self._sleep(0.05)
+
+                if len(samples) < 5:
+                    raise ValueError(f"Insufficient valid positions at {v}V")
+
+                # Use median and IQR filtering, per coordinate
+                samples = np.array(samples)
+                q75, q25 = np.percentile(samples, [75, 25], axis=0)
+                iqr = q75 - q25
+                valid = np.all((samples >= q25 - 1.5*iqr) & (samples <= q75 + 1.5*iqr), axis=1)
+                median_spot = np.median(samples[valid], axis=0)
+                spots.append(median_spot)
+
+                self.__logger.debug(f"Voltage {v:.2f}V -> x={median_spot[0]:.2f} px, "
+                                    f"y={median_spot[1]:.2f} px (n={valid.sum()})")
+
+            spots = np.array(spots)
+            n = len(test_voltages)//2
+
+            def fit_line(voltages, positions):
+                A = np.vstack([voltages, np.ones(len(voltages))]).T
+                return np.linalg.lstsq(A, positions, rcond=None)[0]
+
+            # 4. Direction in which the spot moves with the voltage (from both sweeps); with a
+            # tilted cover glass this is not along the x axis
+            mx = fit_line(test_voltages, spots[:, 0])[0]
+            my = fit_line(test_voltages, spots[:, 1])[0]
+            if np.hypot(mx, my) < 1:
+                raise ValueError(f"Implausible calibration: spot moves only "
+                                 f"{np.hypot(mx, my):.2f} px/V")
+            direction = np.array([mx, my]) / np.hypot(mx, my)
+
+            # 5. Position along that direction; increases with the voltage by construction
+            positions = spots @ direction
+
+            # 6. Two-way linear regression: forward (increasing voltage) and backward sweep
+            # separately, for the hysteresis correction of the lock
+            m_forward, b_forward = fit_line(test_voltages[:n], positions[:n])
+            m_backward, b_backward = fit_line(test_voltages[n:], positions[n:])
+            if m_forward <= 0 or m_backward <= 0:
+                raise ValueError(f"Implausible calibration: forward {m_forward:.2f} px/V, "
+                                 f"backward {m_backward:.2f} px/V")
+
+            # 7. Use average of both directions
+            px_per_volt = (m_forward + m_backward) / 2
+            zero_offset = (b_forward + b_backward) / 2
+
+            # From now on the position signal is measured along the calibrated direction
+            self._direction = direction
+
+            self.sigCalibrationDone.emit({
+                'px_per_volt': px_per_volt, 'zero_offset': zero_offset,
+                'm_forward': m_forward, 'm_backward': m_backward,
+                'angle_deg': float(np.degrees(np.arctan2(direction[1], direction[0])))
+            })
+        except _Aborted:
+            self.sigCalibrationDone.emit({'error': 'aborted'})
+        except Exception as e:
+            self.__logger.error(f"Calibration failed: {str(e)}")
+            self.sigCalibrationDone.emit({'error': str(e)})
+        finally:
+            # Restore original position (also if the calibration failed)
+            if initial_V is not None:
+                self._positioner.setPosition(initial_V, 0)
+            self._busy = False
+
+    @QtCore.Slot(float)
+    def runAutoTune(self, step_size):
+        """ Measures the loop and computes the gains (lock must be off):
+
+        1. Noise and drift: the position signal at rest, sampled at the loop period. A random
+           walk (drift, variance q per frame) and white measurement noise (variance r, e.g.
+           camera noise and vibrations faster than the loop) are separated by how the variance
+           of the differences grows with the lag: Var(lag k) = k*q + 2r. The mean difference
+           per frame is the linear (thermal) drift.
+        2. Step response up and back down: gain in px/V and the delay in frames until the
+           spot has moved.
+        3. The piezo follows the voltage within a frame, so the loop is a pure gain with
+           delay, disturbed by drift and noise. For that the best controller is an integrator:
+           each step corrects the fraction alpha of the measured error. Small alpha averages the
+           noise, large alpha follows the drift; alpha is chosen to minimize the expected error
+           (without linear drift this is the steady-state Kalman gain) and limited for the delay.
+           Ki = alpha / (gain * dt); P and D would only add measurement noise, so Kp = Kd = 0.
+        """
+        self._busy = True
+        self._abort = False
+        start_V = None
+        try:
+            start_V = self._positioner.get_abs()
+            self._sleep(0.5)
+
+            # 1. Noise and drift with the piezo at rest: regression of the variance of the
+            # differences over the lags 1..20 (robust variances, around the median, so a linear
+            # drift doesn't enter q and r)
+            signals, dt = self._sampleSignal(200)
+            lags = np.arange(1, 21)
+            variances = [self._robustVar(signals[lag:] - signals[:-lag]) for lag in lags]
+            q, twoR = np.polyfit(lags, variances, 1)
+            q = max(q, 0.0)  # random-walk drift variance per frame
+            r = max(twoR / 2, 1e-12)  # measurement noise variance per frame
+            noise = np.sqrt(r)
+            ramp = float(np.median(np.diff(signals)))  # linear (thermal) drift per frame
+            baseline = np.median(signals[-20:])
+
+            # 2. Step response up and back down
+            self._positioner.setPosition(start_V + step_size, 0)
+            up, _ = self._sampleSignal(30)
+            self._positioner.setPosition(start_V, 0)
+            down, _ = self._sampleSignal(30)
+            upper, lower = np.median(up[-10:]), np.median(down[-10:])
+            step_px = upper - baseline
+            if abs(step_px) < 10 * noise:
+                raise ValueError(f'the step of {step_size} V moved the spot only {step_px:.2f} px '
+                                 f'(noise {noise:.3f} px); use a larger step')
+            slope = ((upper - baseline) + (upper - lower)) / (2 * step_size)  # px/V, both directions
+            if slope <= 0:
+                raise ValueError('the position signal decreases with the voltage; run the '
+                                 'calibration first, it aligns the signal with the motion')
+
+            def delayFrames(response, start, end):
+                reached = np.nonzero((response - start) / (end - start) >= 0.9)[0]
+                return int(reached[0]) if len(reached) else len(response)
+            delay = max(delayFrames(up, baseline, upper), delayFrames(down, upper, lower))
+            if delay >= 10:
+                raise ValueError(f'the spot needs {delay} frames to follow a step; check the piezo')
+
+            # 3. Integrator gain alpha minimizing the expected RMS error of the locked signal:
+            # random walk and noise give (q + alpha^2 r) / (alpha (2 - alpha)) (minimal at the
+            # steady-state Kalman gain), the linear drift a lag of ramp / alpha. alpha is limited
+            # for the delay (an integrator with n frames delay is stable for
+            # alpha < 2 sin(pi / (2 (2n + 1))); half of that is used as margin).
+            def expectedError(alpha):
+                return np.sqrt((q + alpha ** 2 * r) / (alpha * (2 - alpha)) + (ramp / alpha) ** 2)
+            # Lower limit 0.05 (~20 frames time constant): drift that didn't show up during the
+            # measurement still gets corrected within about a second
+            alpha_max = np.sin(np.pi / (2 * (2 * delay + 1)))
+            alphas = np.linspace(0.05, 1.0, 1000)
+            alpha_opt = float(alphas[np.argmin(expectedError(alphas))])
+            alpha = float(np.clip(alpha_opt, 0.05, alpha_max))
+
+            self.sigAutoTuneDone.emit({
+                'kp': 0.0, 'ki': alpha / (slope * dt), 'kd': 0.0,
+                'alpha': alpha, 'alpha_opt': alpha_opt, 'slope': float(slope),
+                'delay': delay, 'dt': dt, 'noise_px': float(noise), 'drift_px': float(np.sqrt(q)),
+                'ramp_px': ramp, 'stability_px': float(expectedError(alpha))
+            })
+        except _Aborted:
+            self.sigAutoTuneDone.emit({'error': 'aborted'})
+        except Exception as e:
+            self.sigAutoTuneDone.emit({'error': str(e)})
+        finally:
+            if start_V is not None:
+                self._positioner.setPosition(start_V, 0)
+            self._busy = False
+
+    def _sampleSignal(self, n):
+        """ Measures the position signal n times at the period of the lock loop and returns
+        (signals, median period in s). Frames identical to the previous one (camera slower than
+        the loop) are skipped, so every value comes from a new frame. """
+        period = self._updatePeriodMs / 1000
+        signals, times = [], []
+        lastImg = None
+        nextTime = time.perf_counter()
+        for _ in range(10 * n):
+            if len(signals) >= n:
+                break
+            nextTime = max(nextTime + period, time.perf_counter())
+            img = self.grabCameraFrame()
+            if img is not None and not (lastImg is not None and np.array_equal(img, lastImg)):
+                lastImg = img
+                signal = self.positionSignal(self.fitSpot(img, fallback=False))
+                if signal is not None:
+                    signals.append(signal)
+                    times.append(time.perf_counter())
+            self._sleep(max(0.0, nextTime - time.perf_counter()))
+        if len(signals) < n:
+            raise ValueError(f'only {len(signals)} of {n} frames with a spot')
+        dt = float(np.median(np.diff(times))) if len(times) > 1 else period
+        return np.array(signals), dt
+
+    @staticmethod
+    def _robustVar(values):
+        """ Variance from the median absolute deviation; insensitive to single outliers
+        (e.g. vibration spikes or a failed fit). """
+        values = np.asarray(values)
+        return (1.4826 * np.median(np.abs(values - np.median(values)))) ** 2
 
     def grabCameraFrame(self):
         """Grab frame with error handling"""
         try:
-            detector = self._controller._master.detectorsManager[self._controller.camera]
-            img = detector.getLatestFrame()
+            img = self._detector.getLatestFrame()
             return np.swapaxes(img, 0, 1) if img is not None else None
         except Exception as e:
-            self._controller._logger.error(f"Frame grab failed: {str(e)}")
+            self.__logger.error(f"Frame grab failed: {str(e)}")
             return None
 
-    def getBeamPosition(self, img=None):
-        """More robust position detection with dynamic ROI"""
+    def fitSpot(self, img, fallback=True):
+        """ Fits a 2D Gaussian (centre, widths in x and y, amplitude, offset) to the spot in a
+        window around its brightest point and returns the centre (x, y) in px. x is the second
+        image axis. If the fit fails, the last valid centre is returned (fallback=True) or None. """
+        failed = self._last_valid_spot if fallback else None
         if img is None:
-            img = self.grabCameraFrame()
-            if img is None:
-                return self._last_valid_position
-        
-        try:
-            # Dynamic ROI based on last valid position
-            if np.isfinite(self._last_valid_position):
-                x_center = int(self._last_valid_position)
-                roi_width = min(100, img.shape[1]//3)
-                x_start = max(0, x_center - roi_width//2)
-                x_end = min(img.shape[1], x_center + roi_width//2)
-                roi = img[:, x_start:x_end]
-            else:
-                roi = img
-            
-            # Adaptive thresholding
-            threshold = np.percentile(roi, 95)  # Use top 5% pixels
-            mask = roi > threshold
-            
-            # Check if we have enough signal
-            if np.sum(mask) < 10:
-                return self._last_valid_position
-                
-            # Weighted center of mass
-            y, x = ndi.center_of_mass(roi * mask)
-            global_x = x + x_start if 'x_start' in locals() else x
-            
-            # Validate position
-            if not 0 <= global_x < img.shape[1]:
-                return self._last_valid_position
-                
-            # Low-pass filter to reduce jumps
-            filtered_x = 0.8 * global_x + 0.2 * self._last_valid_position
-            self._last_valid_position = filtered_x
-            return filtered_x
-            
-        except Exception as e:
-            self.__logger.warning(f"Position detection error: {str(e)}")
-            return self._last_valid_position
-        
-    def analyzeFrame(self, img):
-        """Main analysis method with calibration support"""
-        if img is None:
-            return self._last_valid_position
+            return failed
 
         try:
-            # Gaussian filter with dynamic sigma based on image size
-            sigma = min(img.shape) * 0.02  # ~2% of image size
-            img_filtered = ndi.gaussian_filter(img, sigma=sigma)
-            
-            # Find brightest region
-            coords = peak_local_max(img_filtered, num_peaks=1, min_distance=20)
-            if len(coords) == 0:
-                return self._last_valid_position
-                
-            y, x = coords[0]
-            return self._fitSubpixelPosition(img_filtered, x, y)
-            
+            img = np.asarray(img, dtype=np.float64)
+
+            # Brightest point of the smoothed image as start value
+            sigma = max(1.0, min(img.shape) * 0.02)  # ~2% of image size
+            smoothed = ndi.gaussian_filter(img, sigma=sigma)
+            py, px = np.unravel_index(np.argmax(smoothed), smoothed.shape)
+
+            # Fit window around it
+            r = self._fit_radius
+            y0, y1 = max(0, py - r), min(img.shape[0], py + r + 1)
+            x0, x1 = max(0, px - r), min(img.shape[1], px + r + 1)
+            window = img[y0:y1, x0:x1]
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+
+            # Start values: offset from the dark pixels, widths from the second moments
+            offset = np.percentile(window, 5)
+            weights = np.clip(window - offset, 0, None)
+            if weights.sum() <= 0:
+                return failed
+            sx = np.sqrt(np.sum(weights * (xx - px) ** 2) / weights.sum())
+            sy = np.sqrt(np.sum(weights * (yy - py) ** 2) / weights.sum())
+            p0 = [window.max() - offset, px, py, max(sx, 1.0), max(sy, 1.0), offset]
+            bounds = ([0, x0, y0, 0.5, 0.5, -np.inf],
+                      [np.inf, x1 - 1, y1 - 1, 2 * r, 2 * r, np.inf])
+
+            popt, _ = curve_fit(self.gaussian_2d, (xx.ravel(), yy.ravel()), window.ravel(),
+                                p0=p0, bounds=bounds, maxfev=2000)
+            spot = (float(popt[1]), float(popt[2]))
+            self._last_valid_spot = spot
+            return spot
+
         except Exception as e:
-            self._controller._logger.warning(f"Analysis error: {str(e)}")
-            return self._last_valid_position
+            self.__logger.warning(f"Spot fit failed: {str(e)}")
+            return failed
 
-    def _fitSubpixelPosition(self, img, approx_x, approx_y):
-        """Robust subpixel fitting with fallback"""
+    def positionSignal(self, spot):
+        """ Position signal for the lock in px: the spot centre along the calibrated direction of
+        motion, or the x coordinate before the first calibration. None if there is no spot. """
+        if spot is None:
+            return None
+        if self._direction is None:
+            return spot[0]
+        return float(np.dot(spot, self._direction))
 
-        try:
-            # Horizontal line profile
-            line_profile = img[approx_y, max(0,approx_x-50):approx_x+50]
-            x = np.arange(len(line_profile))
-            
-            # Gaussian fit
-            popt, _ = curve_fit(
-                self.gaussian_1d,
-                x, line_profile,
-                p0=[line_profile.max(), 50, 10, line_profile.min()],
-                bounds=([0, 0, 1, 0], [np.inf, 100, 100, np.inf]))
-            
-            self._fit_fail_count = 0
-            fitted_x = max(0, approx_x-50) + popt[1]
-            self._last_valid_position = fitted_x
-            return fitted_x
-        
-        except Exception as e:
-            self._fit_fail_count += 1
-            if self._fit_fail_count >= self._max_fit_fails:
-                # Fallback to center of mass
-                com = ndi.center_of_mass(img[max(0,approx_y-30):approx_y+30, 
-                                           max(0,approx_x-30):approx_x+30])
-                self._last_valid_position = approx_x - 30 + com[1]
-                return self._last_valid_position
-            return self._last_valid_position
+    @staticmethod
+    def gaussian_2d(coords, a, x0, y0, sx, sy, offset):
+        """2D Gaussian model (axes along x and y) for fitting"""
+        x, y = coords
+        return a * np.exp(-((x - x0) ** 2) / (2 * sx ** 2) - ((y - y0) ** 2) / (2 * sy ** 2)) + offset
 
-    def gaussian_1d(self, x, a, x0, sigma, offset):
-        """1D Gaussian model for fitting"""
-        return a * np.exp(-((x - x0) ** 2) / (2 * sigma ** 2)) + offset
-
-    def update(self):
-        """Interface-compatible update method"""
-        img = self.grabCameraFrame()
-        return self.analyzeFrame(img)
-
-
-class KalmanFilter:
-    """Simple 1D Kalman filter for position and velocity estimation."""
-    def __init__(self, initial_pos, initial_vel, dt=0.001, process_noise=0.1, measurement_noise=1.0):
-        # State vector: [position, velocity]
-        self.state = np.array([initial_pos, initial_vel])
-        
-        # State transition matrix
-        self.F = np.array([[1, dt],
-                          [0,  1]])
-        
-        # Process noise covariance
-        self.Q = np.array([[dt**3/3, dt**2/2],
-                          [dt**2/2,      dt]]) * process_noise
-        
-        # Measurement matrix (we only measure position)
-        self.H = np.array([[1, 0]])
-        
-        # Measurement noise
-        self.R = np.array([[measurement_noise]])
-        
-        # Covariance matrix
-        self.P = np.eye(2) * 100  # Large initial uncertainty
-
-    def predict(self):
-        # Predict state
-        self.state = self.F @ self.state
-        # Predict covariance
-        self.P = self.F @ self.P @ self.F.T + self.Q
-        return self.state[0]  # Return predicted position
-
-    def update(self, measurement):
-        # Kalman gain
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-        
-        # Update state
-        y = measurement - self.H @ self.state
-        self.state = self.state + K @ y
-        
-        # Update covariance
-        I = np.eye(2)
-        self.P = (I - K @ self.H) @ self.P
-        
-        return self.state[0], self.state[1]  # Return position and velocity
-
-import numpy as np
 
 class PID:
-    """Enhanced discrete PID controller with Kalman filtering and stability monitoring."""
+    """ Discrete PID controller in velocity (incremental) form: update() returns the voltage
+    change for this step, which the controller adds to the piezo voltage. The gains have the
+    usual meaning of a positional PID: kp in V/px, ki in V/(px*s), kd in V*s/px.
+
+    The piezo follows the voltage within one frame, so the integral term does the drift
+    correction; P and D mainly pass measurement noise to the piezo (see FocusWorker.runAutoTune).
+    There is no Kalman filter: inside the loop it doesn't know the piezo corrections and adds
+    lag, and the optimal filter for drift in noise is the integrator gain itself. """
+
     def __init__(self, setpoint, dt=0.001, kp=0, ki=0, kd=0):
         # Gains
         self._kp = kp          # Proportional gain (V/px)
@@ -534,147 +754,51 @@ class PID:
         self._kd = kd          # Derivative gain (V/(px/s))
 
         self._started = False
-        
+
         # Control parameters
         self._setpoint = setpoint  # Target position (px)
-        self._dt = dt          # Time step (s)
-        self.volts_per_px = None  # Calibration factor
-        
+        self._dt = dt          # Nominal time step (s), used if update() gets no dt
+
         # State variables
-        self._integral = 0
-        self._last_error = 0
-        self._last_derivative = 0 
-        self._output = 0
-        
-        # Anti-windup and limits
-        self.integral_min = -5  # Conservative limits
-        self.integral_max = 5
-        self.output_min = -10
-        self.output_max = 10
-        
-        # Kalman filter setup
-        self._kf = None
-        self.last_position = 0
-        self.last_velocity = 0
-        
+        self._last_error = None
+        self._prev_error = None
+        self._p = self._i = self._d = 0  # terms of the last update, for monitoring
+
         # Stability monitoring
         self.error_history = []
         self.stability_counter = 0
         self.max_unstable_count = 10
         self.stable_threshold = 1.0  # px RMS error for stability
-        
-        # Dynamic control parameters
-        self.derivative_alpha = 0.3  # Smoothing factor for derivative
-        self.error_scaling = 1.0     # Dynamic error scaling
 
-    def setCalibration(self, volts_per_px):
-        """Update calibration values with validation"""
-        if abs(volts_per_px) < 1e-6:  # Avoid division by zero
-            raise ValueError("Calibration factor too small")
-        self.volts_per_px = volts_per_px
-
-    def update(self, current_px):
+    def update(self, current_px, dt=None):
         """
         Update controller with new measurement.
-        Returns control output in volts.
+        Returns the voltage change for this step in volts.
         """
-        # Initialize Kalman filter if needed
-        if self._kf is None:
-            self._init_kalman(current_px)
-        
-        # Get filtered position and velocity estimates
-        filtered_pos, filtered_vel = self._update_kalman(current_px)
-        
-        # Calculate error with dynamic scaling
-        error_px, error = self._calculate_error(filtered_pos)
-        
-        # Calculate PID terms
-        p_term, i_term, d_term = self._calculate_terms(error, filtered_vel)
-        
-        # Combine terms with output limiting
-        self._output = self._limit_output(p_term + i_term + d_term)
-        
+        dt = dt if dt else self._dt
+        error = self._setpoint - current_px
+        if self._last_error is None:
+            self._last_error = error  # no P/D kick on the first step
+        if self._prev_error is None:
+            self._prev_error = self._last_error
+
+        # Incremental form of u = kp*e + ki*integral(e) + kd*de/dt
+        self._p = self._kp * (error - self._last_error)
+        self._i = self._ki * error * dt
+        self._d = self._kd * (error - 2 * self._last_error + self._prev_error) / dt
+        self._prev_error, self._last_error = self._last_error, error
+
         # Monitor stability
-        self._check_stability(error_px)
-        
-        return self._output
+        self._check_stability(error)
 
-    def _init_kalman(self, current_px):
-        """Initialize Kalman filter with reasonable defaults"""
-        self._kf = KalmanFilter(
-            initial_pos=current_px,
-            initial_vel=0,
-            dt=self._dt,
-            process_noise=0.1,  # Adjust based on your system dynamics
-            measurement_noise=1.0  # Should match your measurement variance
-        )
-        self.last_position = current_px
-        self.last_velocity = 0
-
-    def _update_kalman(self, current_px):
-        """Update Kalman filter and return filtered estimates"""
-        self._kf.predict()
-        filtered_pos, filtered_vel = self._kf.update(current_px)
-        self.last_position = filtered_pos
-        self.last_velocity = filtered_vel
-        return filtered_pos, filtered_vel
-
-    def _calculate_error(self, filtered_pos):
-        """Calculate error with dynamic scaling"""
-        error_px = self._setpoint - filtered_pos
-        
-        # Dynamic error scaling - reduces aggression for large errors
-        self.error_scaling = min(1.0, abs(error_px)/5.0)  # Scale down large errors
-        
-        if self.volts_per_px:
-            error = error_px * self.error_scaling * self.volts_per_px
-        else:
-            error = error_px * self.error_scaling
-            
-        return error_px, error
-
-    def _calculate_terms(self, error, filtered_vel):
-        """Calculate PID terms with anti-windup and filtering"""
-        # Proportional term
-        p_term = self._kp * error
-        
-        # Integral term with conditional integration and anti-windup
-        if abs(error) < 5:  # Only integrate when close to target
-            self._integral += error * self._dt
-        else:
-            self._integral *= 0.95  # Leaky integration
-        
-        self._integral = np.clip(self._integral, self.integral_min, self.integral_max)
-        i_term = self._ki * self._integral
-        
-        # Derivative term using filtered velocity
-        if self.volts_per_px:
-            d_term = self._kd * (-filtered_vel * self.volts_per_px)
-        else:
-            d_term = self._kd * (-filtered_vel)
-            
-        # Apply low-pass filtering to derivative term
-        d_term = self.derivative_alpha * d_term + (1 - self.derivative_alpha) * self._last_derivative
-        self._last_derivative = d_term
-        
-        return p_term, i_term, d_term
-
-    def _limit_output(self, output):
-        """Apply output limits with anti-windup compensation"""
-        limited_output = np.clip(output, self.output_min, self.output_max)
-        
-        # Anti-windup: only integrate if not saturating
-        if output != limited_output:
-            self._integral -= (output - limited_output) * self._dt
-            
-        return limited_output
+        return self._p + self._i + self._d
 
     def _check_stability(self, error_px):
         """Monitor stability and detect oscillations"""
         self.error_history.append(abs(error_px))
         if len(self.error_history) > 100:
             self.error_history.pop(0)
-            
+
         if len(self.error_history) == 100:
             rms_error = np.sqrt(np.mean(np.array(self.error_history)**2))
             if rms_error > self.stable_threshold:
@@ -685,31 +809,19 @@ class PID:
                 self.stability_counter = 0
 
     def reset(self):
-        """Reset controller state while preserving calibration"""
-        self._integral = 0
-        self._last_error = 0
-        self._last_derivative = 0
+        """Reset controller state"""
+        self._last_error = None
+        self._prev_error = None
         self.error_history = []
         self.stability_counter = 0
-        
-        if self._kf is not None:
-            self._kf = KalmanFilter(
-                self.last_position,
-                self.last_velocity,
-                self._dt
-            )
 
     def restart(self):
         self._started = False
 
     @property
     def terms(self):
-        """Return current PID terms for monitoring"""
-        return {
-            'p': self._kp * self._last_error,
-            'i': self._ki * self._integral,
-            'd': self._last_derivative
-        }
+        """Return the terms of the last update (voltage changes) for monitoring"""
+        return {'p': self._p, 'i': self._i, 'd': self._d}
 
     @property
     def started(self):
@@ -721,11 +833,11 @@ class PID:
 
     @property
     def setPoint(self):
-        return self._setPoint
+        return self._setpoint
 
     @setPoint.setter
     def setPoint(self, value):
-        self._setPoint = value
+        self._setpoint = value
 
     @property
     def kp(self):
@@ -742,19 +854,11 @@ class PID:
     @ki.setter
     def ki(self, value):
         self._ki = value
-        
+
     @property
     def kd(self):
         return self._kd
-    
+
     @kd.setter
     def kd(self, value):
         self._kd = value
-    
-    @property
-    def kf(self):
-        return self._kf
-    
-    @kf.setter
-    def kf(self, value):
-        self._kf = value

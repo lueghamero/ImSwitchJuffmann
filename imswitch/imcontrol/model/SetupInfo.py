@@ -176,6 +176,10 @@ class iScatFocusInfo:
     frameCroph: int
     """ Height of frame crop. """
 
+    piezoNmPerVolt: Optional[float] = None
+    """ Focus change of the piezo in nm per volt. Optional; if set, the auto-tune
+    shows the expected lock stability in nm. """
+
 @dataclass(frozen=True)
 class AutofocusInfo:
     camera: str
@@ -307,9 +311,9 @@ class SetupInfo:
     """ Focus lock settings. Required to be defined to use focus lock
     functionality. """
     
-    iScatFocus: Optional[FocusLockInfo] = field(default_factory=lambda: None)
-    """ Focus lock settings. Required to be defined to use focus lock
-    functionality. """
+    iScatFocus: Optional[iScatFocusInfo] = field(default_factory=lambda: None)
+    """ iScat focus lock settings. Required to be defined to use the iScat
+    focus lock functionality. """
     
     autofocus: Optional[AutofocusInfo] = field(default_factory=lambda: None)
     """ Autofocus  settings. Required to be defined to use autofocus 
